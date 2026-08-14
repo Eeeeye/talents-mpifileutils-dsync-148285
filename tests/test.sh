@@ -4,6 +4,8 @@ set -Eeuo pipefail
 log_dir=/logs/verifier
 mkdir -p "${log_dir}"
 
+test_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+
 if [[ "$(id -u)" -eq 0 && "${MFU_VERIFIER_AS_USER:-0}" != 1 ]]; then
     chown -R ubuntu:ubuntu "${log_dir}" /workspace/mpifileutils
     exec runuser -u ubuntu -- env \
@@ -80,21 +82,27 @@ run_dcmp() {
 
 nonce="$(date +%s%N)-$$"
 case_root="$(mktemp -d "/tmp/dsync-verifier-${nonce}.XXXXXX")"
+xattr_helper="${case_root}/xattr-helper"
+cc -std=c11 -O2 -Wall -Wextra -Werror \
+    "${test_dir}/xattr_helper.c" -o "${xattr_helper}"
 
 printf '\n[1] ordinary MPI copy, metadata, whitespace, and successful delete\n'
 basic="${case_root}/ordinary tree"
 mkdir -p "${basic}/source/nested data"
 printf 'alpha-%s\n' "${nonce}" > "${basic}/source/nested data/payload.bin"
 chmod 0640 "${basic}/source/nested data/payload.bin"
-setfattr -n user.dataset -v "batch-${nonce}" "${basic}/source/nested data/payload.bin"
+chmod 0750 "${basic}/source/nested data"
+"${xattr_helper}" set "${basic}/source/nested data/payload.bin" user.dataset "batch-${nonce}"
 ln -s 'nested data/payload.bin' "${basic}/source/current link"
 run_dsync 3 -X all "${basic}/source" "${basic}/destination" >/dev/null
 cmp "${basic}/source/nested data/payload.bin" "${basic}/destination/nested data/payload.bin" \
     || fail "ordinary file bytes differ"
 assert_equal "640" "$(stat -c '%a' "${basic}/destination/nested data/payload.bin")" \
     "file mode was not preserved"
+assert_equal "750" "$(stat -c '%a' "${basic}/destination/nested data")" \
+    "directory mode was not preserved"
 assert_equal "batch-${nonce}" \
-    "$(getfattr --only-values -n user.dataset "${basic}/destination/nested data/payload.bin" 2>/dev/null)" \
+    "$("${xattr_helper}" get "${basic}/destination/nested data/payload.bin" user.dataset)" \
     "extended attribute was not preserved"
 assert_equal 'nested data/payload.bin' "$(readlink "${basic}/destination/current link")" \
     "symbolic link was not copied"
@@ -105,13 +113,25 @@ pass "ordinary copy and successful --delete"
 
 printf '\n[2] failed source walk disables destructive deletion but keeps useful work\n'
 walk="${case_root}/walk-${nonce}"
-mkdir -p "${walk}/source/restricted" "${walk}/destination/restricted"
+mkdir -p \
+    "${walk}/source/restricted" \
+    "${walk}/destination/restricted" \
+    "${walk}/source/discovered-dir" \
+    "${walk}/destination/discovered-dir"
 printf 'checkpoint-%s\n' "${nonce}" > "${walk}/source/restricted/checkpoint.dat"
 printf 'checkpoint-%s\n' "${nonce}" > "${walk}/destination/restricted/checkpoint.dat"
 printf 'hidden-retain-%s\n' "${nonce}" > "${walk}/destination/restricted/destination-state.dat"
 printf 'top-retain-%s\n' "${nonce}" > "${walk}/destination/destination-only.dat"
 printf 'new-visible-payload-%s\n' "${nonce}" > "${walk}/source/visible.dat"
 printf 'old-%s\n' "${nonce}" > "${walk}/destination/visible.dat"
+printf 'metadata-only-%s\n' "${nonce}" > "${walk}/source/metadata-only.dat"
+cp "${walk}/source/metadata-only.dat" "${walk}/destination/metadata-only.dat"
+touch -d '2025-04-05 06:07:08.123456789 UTC' \
+    "${walk}/source/metadata-only.dat" "${walk}/destination/metadata-only.dat"
+chmod 0640 "${walk}/source/metadata-only.dat"
+chmod 0600 "${walk}/destination/metadata-only.dat"
+chmod 0750 "${walk}/source/discovered-dir"
+chmod 0700 "${walk}/destination/discovered-dir"
 chmod 000 "${walk}/source/restricted"
 set +e
 run_dsync 2 --delete "${walk}/source" "${walk}/destination" \
@@ -126,6 +146,10 @@ assert_file "${walk}/destination/restricted/destination-state.dat"
 assert_file "${walk}/destination/destination-only.dat"
 cmp "${walk}/source/visible.dat" "${walk}/destination/visible.dat" \
     || fail "visible source work did not continue after the walk error"
+assert_equal "640" "$(stat -c '%a' "${walk}/destination/metadata-only.dat")" \
+    "metadata-only update did not continue after the walk error"
+assert_equal "750" "$(stat -c '%a' "${walk}/destination/discovered-dir")" \
+    "discovered directory permissions were not synchronized after the walk error"
 grep -Eiq 'source.*walk|walk.*source' "${walk}/failed-walk.log" \
     || fail "source-walk diagnostic is missing"
 grep -Eiq 'delete[^[:cntrl:]]*disabl|disabl[^[:cntrl:]]*delete' "${walk}/failed-walk.log" \
@@ -136,7 +160,27 @@ assert_absent "${walk}/destination/restricted/destination-state.dat"
 assert_file "${walk}/destination/restricted/checkpoint.dat"
 pass "failed-walk safety and successful-walk delete distinction"
 
-printf '\n[3] symbolic-link targets participate in dcmp and dsync\n'
+printf '\n[3] zero-item invalid-source guard protects the destination\n'
+invalid="${case_root}/invalid-${nonce}"
+mkdir -p "${invalid}/destination/retained-dir"
+printf 'retain-%s\n' "${nonce}" > "${invalid}/destination/retained-dir/state.dat"
+invalid_before="$(sha256sum "${invalid}/destination/retained-dir/state.dat")|$(stat -c '%a' "${invalid}/destination/retained-dir")"
+set +e
+run_dsync 2 --delete "${invalid}/source-does-not-exist" "${invalid}/destination" \
+    > "${invalid}/invalid-source.log" 2>&1
+invalid_rc=$?
+set -e
+[[ "${invalid_rc}" -ne 0 ]] || fail "invalid zero-item source unexpectedly succeeded"
+assert_file "${invalid}/destination/retained-dir/state.dat"
+invalid_after="$(sha256sum "${invalid}/destination/retained-dir/state.dat")|$(stat -c '%a' "${invalid}/destination/retained-dir")"
+assert_equal "${invalid_before}" "${invalid_after}" \
+    "invalid zero-item source changed protected destination state"
+grep -Eiq 'no items found at source|invalid source|source.*not found' \
+    "${invalid}/invalid-source.log" \
+    || fail "invalid-source guard diagnostic is missing"
+pass "invalid source guard and destination preservation"
+
+printf '\n[4] symbolic-link targets participate in dcmp and dsync\n'
 links="${case_root}/links-${nonce}"
 mkdir -p "${links}/source"
 printf 'A-%s\n' "${nonce}" > "${links}/source/generation-A"
@@ -175,7 +219,7 @@ assert_equal "${before_link_mtime}" "$(stat -c '%y' "${links}/destination/curren
     "matching link was rewritten on repeat sync"
 pass "relative, absolute, and dangling link comparison"
 
-printf '\n[4] dereference mode and option order\n'
+printf '\n[5] dereference mode and option order\n'
 deref="${case_root}/deref-${nonce}"
 mkdir -p "${deref}/source"
 printf 'materialized-%s\n' "${nonce}" > "${deref}/source/payload.dat"
@@ -192,7 +236,7 @@ run_dsync 2 -L -P "${deref}/source" "${deref}/dest-last-P" >/dev/null
 assert_link "${deref}/dest-last-P/link.dat"
 pass "dereference, no-dereference, and last-option semantics"
 
-printf '\n[5] coarse and high-resolution mtime boundaries\n'
+printf '\n[6] coarse and high-resolution mtime boundaries\n'
 coarse="${case_root}/coarse-${nonce}"
 mkdir -p "${coarse}/source" "${coarse}/destination"
 printf 'same-%s\n' "${nonce}" > "${coarse}/source/sample.dat"
@@ -219,7 +263,7 @@ assert_equal "${expected_highres}" "$(stat -c '%y' "${highres}/destination/sampl
     "real nanosecond difference was ignored on high-resolution paths"
 pass "timestamp precision boundaries"
 
-printf '\n[6] missing destination, --contents, dry-run, and repeat idempotence\n'
+printf '\n[7] missing destination, --contents, dry-run, and repeat idempotence\n'
 content_case="${case_root}/content-${nonce}"
 mkdir -p "${content_case}/source" "${content_case}/destination"
 printf 'AAAA-%s\n' "${nonce}" > "${content_case}/source/equal-size.dat"
@@ -247,9 +291,9 @@ assert_equal "${dry_before}" "$(sha256sum "${dry}/destination/item.dat")" \
     "--dryrun mutated destination bytes"
 
 idem_file="${basic}/destination/nested data/payload.bin"
-idem_before="$(sha256sum "${idem_file}")|$(stat -c '%a|%y' "${idem_file}")|$(getfattr --only-values -n user.dataset "${idem_file}" 2>/dev/null)|$(readlink "${basic}/destination/current link")"
+idem_before="$(sha256sum "${idem_file}")|$(stat -c '%a|%y' "${idem_file}")|$("${xattr_helper}" get "${idem_file}" user.dataset)|$(readlink "${basic}/destination/current link")|$(stat -c '%a' "${basic}/destination/nested data")"
 run_dsync 2 -X all "${basic}/source" "${basic}/destination" >/dev/null
-idem_after="$(sha256sum "${idem_file}")|$(stat -c '%a|%y' "${idem_file}")|$(getfattr --only-values -n user.dataset "${idem_file}" 2>/dev/null)|$(readlink "${basic}/destination/current link")"
+idem_after="$(sha256sum "${idem_file}")|$(stat -c '%a|%y' "${idem_file}")|$("${xattr_helper}" get "${idem_file}" user.dataset)|$(readlink "${basic}/destination/current link")|$(stat -c '%a' "${basic}/destination/nested data")"
 assert_equal "${idem_before}" "${idem_after}" "repeat synchronization changed preserved state"
 pass "content mode, dry-run, missing destination, and idempotence"
 
