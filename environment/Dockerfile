@@ -31,6 +31,14 @@ RUN sed -i \
     && dpkg-query -W -f='${Package}\t${Version}\n' | sort > /opt/environment-package-versions.txt \
     && rm -rf /var/lib/apt/lists/*
 
+# The pinned Ubuntu image may already provide this account, but task.toml's
+# Agent user must also be explicitly declared in the Dockerfile for the
+# platform initializer.  Keep the step idempotent across base-image revisions.
+RUN if ! id -u ubuntu >/dev/null 2>&1; then \
+      useradd --create-home --shell /bin/bash ubuntu; \
+    fi \
+    && install -d -o ubuntu -g ubuntu /home/ubuntu
+
 ENV MFU_DEPS_PREFIX=/opt/mfu-deps
 ENV PKG_CONFIG_PATH=/opt/mfu-deps/lib/pkgconfig
 ENV LD_LIBRARY_PATH=/opt/mfu-deps/lib
