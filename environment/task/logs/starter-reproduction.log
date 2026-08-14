@@ -1,0 +1,14 @@
+case 1: incomplete source walk with --delete
+destination checkpoint: missing
+[2026-08-14T06:03:33] [1] [/workspace/mpifileutils/src/common/mfu_flist_walk.c:476] ERROR: Failed to open directory with opendir: '/tmp/dsync-reproduction.FFVQmX/walk/src/restricted' (errno=2 No such file or directory)
+
+case 2: changed symbolic-link target
+dcmp classification: common
+destination target: generation-A
+
+case 3: --dereference
+destination type: symbolic link
+
+case 4: whole-second timestamp precision
+destination mtime before: 2025-01-02 03:04:05.999999999 +0000
+destination mtime after:  2025-01-02 03:04:05.111111111 +0000

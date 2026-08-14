@@ -1,0 +1,495 @@
+diff --git a/src/common/mfu_flist.h b/src/common/mfu_flist.h
+index d2ed0a3..58dc0c4 100644
+--- a/src/common/mfu_flist.h
++++ b/src/common/mfu_flist.h
+@@ -180,7 +180,7 @@ void mfu_flist_free(mfu_flist* flist);
+  * optionally stat each item, and optionally
+  * set directory permission bits in order to walk into a directory,
+  * whose permission bits are otherwise restrictive (e.g., useful for recursive unlink) */
+-void mfu_flist_walk_path(
++int mfu_flist_walk_path(
+     const char* path,           /* IN  - path to be walked */
+     mfu_walk_opts_t* walk_opts, /* IN  - functions to perform during the walk */
+     mfu_flist flist,            /* OUT - flist to insert walked items into */
+@@ -188,7 +188,7 @@ void mfu_flist_walk_path(
+ );
+ 
+ /* create file list by walking list of directories */
+-void mfu_flist_walk_paths(
++int mfu_flist_walk_paths(
+     uint64_t num_paths,         /* IN  - number of paths in array */
+     const char** paths,         /* IN  - array of paths to be walkted */
+     mfu_walk_opts_t* walk_opts, /* IN  - functions to perform during the walk */
+@@ -197,7 +197,7 @@ void mfu_flist_walk_paths(
+ );
+ 
+ /* given a list of param_paths, walk each one and add to flist */
+-void mfu_flist_walk_param_paths(
++int mfu_flist_walk_param_paths(
+     uint64_t num,                 /* IN  - number of paths in array */
+     const mfu_param_path* params, /* IN  - array of paths to be walkted */
+     mfu_walk_opts_t* walk_opts,   /* IN  - functions to perform during the walk */
+diff --git a/src/common/mfu_flist_walk.c b/src/common/mfu_flist_walk.c
+index 120976e..85190bc 100644
+--- a/src/common/mfu_flist_walk.c
++++ b/src/common/mfu_flist_walk.c
+@@ -51,6 +51,7 @@ static flist_t* CURRENT_LIST;
+ static int SET_DIR_PERMS;
+ static int REMOVE_FILES;
+ static int DEREFERENCE;
++static int WALK_RESULT = 0;
+ static mfu_file_t** CURRENT_PFILE;
+ 
+ /****************************************
+@@ -116,6 +117,7 @@ static int build_path(char* path, size_t path_len, const char* dir, const char*
+     if (new_len > path_len) {
+         MFU_LOG(MFU_LOG_ERR, "Path name is too long, %lu chars exceeds limit %lu: '%s/%s'",
+                 new_len, path_len, dir, name);
++        WALK_RESULT = -1;
+         return -1;
+     }
+ 
+@@ -188,6 +190,7 @@ static void walk_getdents_process_dir(const char* dir, CIRCLE_handle* handle)
+     if (mfu_file->fd == -1) {
+         /* print error */
+         MFU_LOG(MFU_LOG_ERR, "Failed to open directory for reading: `%s' (errno=%d %s)", dir, errno, strerror(errno));
++        WALK_RESULT = -1;
+         return;
+     }
+ 
+@@ -200,6 +203,7 @@ static void walk_getdents_process_dir(const char* dir, CIRCLE_handle* handle)
+         int nread = syscall(SYS_getdents, mfu_file->fd, buf, (int) BUF_SIZE);
+         if (nread == -1) {
+             MFU_LOG(MFU_LOG_ERR, "syscall to getdents failed when reading `%s' (errno=%d %s)", dir, errno, strerror(errno));
++            WALK_RESULT = -1;
+             break;
+         }
+ 
+@@ -289,6 +293,7 @@ static void walk_getdents_create(CIRCLE_handle* handle)
+         if (status != 0) {
+             MFU_LOG(MFU_LOG_ERR, "Failed to stat: '%s' (errno=%d %s)",
+                     path, errno, strerror(errno));
++            WALK_RESULT = -1;
+             return;
+         }
+ 
+@@ -347,6 +352,7 @@ static void walk_readdir_process_dir(const char* dir, CIRCLE_handle* handle)
+     if (! dirp) {
+         MFU_LOG(MFU_LOG_ERR, "Failed to open directory with opendir: '%s' (errno=%d %s)",
+                 dir, errno, strerror(errno));
++        WALK_RESULT = -1;
+     }
+     else {
+         /* Read all directory entries */
+@@ -398,6 +404,7 @@ static void walk_readdir_process_dir(const char* dir, CIRCLE_handle* handle)
+                         else {
+                             MFU_LOG(MFU_LOG_ERR, "Failed to stat: '%s' (errno=%d %s)",
+                                     newpath, errno, strerror(errno));
++                            WALK_RESULT = -1;
+                         }
+                     }
+ 
+@@ -433,6 +440,7 @@ static void walk_readdir_create(CIRCLE_handle* handle)
+         if (status != 0) {
+             MFU_LOG(MFU_LOG_ERR, "Failed to stat: '%s' (errno=%d %s)",
+                     path, errno, strerror(errno));
++            WALK_RESULT = -1;
+             return;
+         }
+ 
+@@ -475,6 +483,7 @@ static void walk_stat_process_dir(char* dir, CIRCLE_handle* handle)
+     if (! dirp) {
+         MFU_LOG(MFU_LOG_ERR, "Failed to open directory with opendir: '%s' (errno=%d %s)",
+                 dir, errno, strerror(errno));
++        WALK_RESULT = -1;
+     }
+     else {
+         while (1) {
+@@ -533,6 +542,7 @@ static void walk_stat_process(CIRCLE_handle* handle)
+     if (status != 0) {
+         MFU_LOG(MFU_LOG_ERR, "Failed to stat: '%s' (errno=%d %s)",
+                 path, errno, strerror(errno));
++        WALK_RESULT = -1;
+         return;
+     }
+ 
+@@ -570,17 +580,16 @@ static void walk_stat_process(CIRCLE_handle* handle)
+ }
+ 
+ /* Set up and execute directory walk */
+-void mfu_flist_walk_path(const char* dirpath,
++int mfu_flist_walk_path(const char* dirpath,
+                          mfu_walk_opts_t* walk_opts,
+                          mfu_flist bflist,
+                          mfu_file_t* mfu_file)
+ {
+-    mfu_flist_walk_paths(1, &dirpath, walk_opts, bflist, mfu_file);
+-    return;
++    return mfu_flist_walk_paths(1, &dirpath, walk_opts, bflist, mfu_file);
+ }
+ 
+ /* Set up and execute directory walk */
+-void mfu_flist_walk_paths(uint64_t num_paths, const char** paths,
++int mfu_flist_walk_paths(uint64_t num_paths, const char** paths,
+                           mfu_walk_opts_t* walk_opts, mfu_flist bflist,
+                           mfu_file_t* mfu_file)
+ {
+@@ -703,11 +712,14 @@ void mfu_flist_walk_paths(uint64_t num_paths, const char** paths,
+     /* hold procs here until summary is printed */
+     MPI_Barrier(MPI_COMM_WORLD);
+ 
+-    return;
++    int all_rc;
++    MPI_Allreduce(&WALK_RESULT, &all_rc, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
++
++    return all_rc;
+ }
+ 
+ /* given a list of param_paths, walk each one and add to flist */
+-void mfu_flist_walk_param_paths(uint64_t num,
++int mfu_flist_walk_param_paths(uint64_t num,
+                                 const mfu_param_path* params,
+                                 mfu_walk_opts_t* walk_opts,
+                                 mfu_flist flist,
+@@ -715,13 +727,14 @@ void mfu_flist_walk_param_paths(uint64_t num,
+ {
+     /* allocate memory to hold a list of paths */
+     const char** path_list = (const char**) MFU_MALLOC(num * sizeof(char*));
++    int walk_result;
+ 
+ #ifdef DAOS_SUPPORT
+     /* DAOS only supports using one source path */
+     if (mfu_file->type == DFS) {
+         if (num != 1) {
+             MFU_LOG(MFU_LOG_ERR, "Only one source can be specified when using DAOS");
+-            return;
++            return EINVAL;
+         }
+     }
+ #endif
+@@ -734,12 +747,12 @@ void mfu_flist_walk_param_paths(uint64_t num,
+     }
+ 
+     /* walk file tree and record stat data for each file */
+-    mfu_flist_walk_paths((uint64_t) num, path_list, walk_opts, flist, mfu_file);
++    walk_result = mfu_flist_walk_paths((uint64_t) num, path_list, walk_opts, flist, mfu_file);
+ 
+     /* free the list */
+     mfu_free(&path_list);
+ 
+-    return;
++    return walk_result;
+ }
+ 
+ /* Given an input file list, stat each file and enqueue details
+@@ -806,6 +819,7 @@ void mfu_flist_stat(
+             if (status != 0) {
+                 MFU_LOG(MFU_LOG_ERR, "mfu_file_stat() failed: '%s' rc=%d (errno=%d %s)",
+                         name, status, errno, strerror(errno));
++                WALK_RESULT = -1;
+                 continue;
+             }
+         } else {
+@@ -814,6 +828,7 @@ void mfu_flist_stat(
+             if (status != 0) {
+                 MFU_LOG(MFU_LOG_ERR, "mfu_file_lstat() failed: '%s' rc=%d (errno=%d %s)",
+                         name, status, errno, strerror(errno));
++                WALK_RESULT = -1;
+                 continue;
+             }
+         }
+diff --git a/src/common/mfu_util.c b/src/common/mfu_util.c
+index 9105e93..5b374cf 100644
+--- a/src/common/mfu_util.c
++++ b/src/common/mfu_util.c
+@@ -996,6 +996,35 @@ int mfu_compare_contents(
+     return rc;
+ }
+ 
++/* compares targets of two symlinks, returns 0 if equal, positive value if
++ * different, -1 on error when reading symlink. */
++int mfu_compare_symlinks(
++    const char* src_name,          /* IN  - path name to source file */
++    const char* dst_name,          /* IN  - path name to destination file */
++    mfu_file_t* mfu_src_file,      /* IN  - I/O filesystem functions to use for source */
++    mfu_file_t* mfu_dst_file)      /* IN  - I/O filesystem functions to use for destination */
++{
++    char src_target[PATH_MAX + 1], dst_target[PATH_MAX + 1];
++    ssize_t src_len = mfu_file_readlink(src_name, src_target, sizeof(src_target) - 1, mfu_src_file);
++    if(src_len < 0) {
++        MFU_LOG(MFU_LOG_ERR, "Failed to read source link `%s' readlink() (errno=%d %s)",
++            src_name, errno, strerror(errno)
++        );
++        return -1;
++    }
++    ssize_t dst_len = mfu_file_readlink(dst_name, dst_target, sizeof(dst_target) - 1, mfu_dst_file);
++    if(dst_len < 0) {
++        MFU_LOG(MFU_LOG_ERR, "Failed to read destination link `%s' readlink() (errno=%d %s)",
++            dst_name, errno, strerror(errno)
++        );
++        return -1;
++    }
++    /* ensure that strings end with NUL */
++    src_target[src_len] = '\0';
++    dst_target[dst_len] = '\0';
++    return abs(strcmp(src_target, dst_target));
++}
++
+ /* uses the lustre api to obtain stripe count and stripe size of a file */
+ int mfu_stripe_get(const char *path, uint64_t *stripe_size, uint64_t *stripe_count)
+ {
+diff --git a/src/common/mfu_util.h b/src/common/mfu_util.h
+index 73b1c27..f8e2572 100644
+--- a/src/common/mfu_util.h
++++ b/src/common/mfu_util.h
+@@ -266,6 +266,15 @@ int mfu_compare_contents(
+     mfu_file_t* mfu_dst_file  /* IN  - I/O filesystem functions to use for destination */
+ );
+ 
++/* compares targets of two symlinks, returns 0 if equal, positive value if
++ * different, -1 on error when reading symlink. */
++int mfu_compare_symlinks(
++    const char* src_name,     /* IN  - path name to souce file */
++    const char* dst_name,     /* IN  - path name to destination file */
++    mfu_file_t* mfu_src_file, /* IN  - I/O filesystem functions to use for source */
++    mfu_file_t* mfu_dst_file  /* IN  - I/O filesystem functions to use for destination */
++);
++
+ /* uses the lustre api to obtain stripe count and stripe size of a file */
+ int mfu_stripe_get(const char *path, uint64_t *stripe_size, uint64_t *stripe_count);
+ 
+diff --git a/src/dcmp/dcmp.c b/src/dcmp/dcmp.c
+index 7a77490..082e849 100644
+--- a/src/dcmp/dcmp.c
++++ b/src/dcmp/dcmp.c
+@@ -1084,13 +1084,38 @@ static int dcmp_strmap_compare(
+             continue;
+         }
+ 
+-        if (! S_ISREG(dst_mode)) {
+-            /* not regular file, take them as common content */
++        /* for now, we can only compare content of regular files and symlinks */
++        if (! S_ISREG(dst_mode) && ! S_ISLNK(dst_mode)) {
++            /* not regular file or symlink, take them as common content */
+             dcmp_strmap_item_update(src_map, key, DCMPF_CONTENT, DCMPS_COMMON);
+             dcmp_strmap_item_update(dst_map, key, DCMPF_CONTENT, DCMPS_COMMON);
+             continue;
+         }
+ 
++        /* For symlinks, compare targets */
++        if (S_ISLNK(dst_mode)) {
++            const char* src_name = mfu_flist_file_get_name(src_list, src_index);
++            const char* dst_name = mfu_flist_file_get_name(dst_list, dst_index);
++            int compare_rc = mfu_compare_symlinks(src_name, dst_name, mfu_src_file, mfu_dst_file);
++            if (compare_rc == -1) {
++                /* we hit an error while reading the symlink */
++                rc = -1;
++                MFU_LOG(MFU_LOG_ERR,
++                    "Failed to readlink on %s and/or %s. Assuming contents are different.",
++                    src_name, dst_name);
++            }
++            if (!compare_rc) {
++                /* update to say contents of the symlinks were found to be the same */
++                dcmp_strmap_item_update(src_map, key, DCMPF_CONTENT, DCMPS_COMMON);
++                dcmp_strmap_item_update(dst_map, key, DCMPF_CONTENT, DCMPS_COMMON);
++            } else {
++                /* update to say contents of the symlinks were found to be different */
++                dcmp_strmap_item_update(src_map, key, DCMPF_CONTENT, DCMPS_DIFFER);
++                dcmp_strmap_item_update(dst_map, key, DCMPF_CONTENT, DCMPS_DIFFER);
++            }
++            continue;
++        }
++
+         dcmp_state state;
+         tmp_rc = dcmp_strmap_item_state(src_map, key, DCMPF_SIZE, &state);
+         assert(tmp_rc == 0);
+@@ -2328,12 +2353,12 @@ int main(int argc, char **argv)
+     if (rank == 0) {
+         MFU_LOG(MFU_LOG_INFO, "Walking source path");
+     }
+-    mfu_flist_walk_param_paths(1,  srcpath, walk_opts, flist1, mfu_src_file);
++    (void) mfu_flist_walk_param_paths(1,  srcpath, walk_opts, flist1, mfu_src_file);
+ 
+     if (rank == 0) {
+         MFU_LOG(MFU_LOG_INFO, "Walking destination path");
+     }
+-    mfu_flist_walk_param_paths(1, destpath, walk_opts, flist2, mfu_dst_file);
++    (void) mfu_flist_walk_param_paths(1, destpath, walk_opts, flist2, mfu_dst_file);
+ 
+     /* store src and dest path strings */
+     const char* path1 = srcpath->path;
+diff --git a/src/dsync/dsync.c b/src/dsync/dsync.c
+index ab55fb7..8dc42df 100644
+--- a/src/dsync/dsync.c
++++ b/src/dsync/dsync.c
+@@ -48,6 +48,9 @@
+ #include "mfu_daos.h"
+ #endif
+ 
++/* True if both src and dest file systems support nsec field in mtime */
++static bool comp_mtime_nsec = true;
++
+ /* Print a usage message */
+ static void print_usage(void)
+ {
+@@ -1152,7 +1155,7 @@ static void dsync_strmap_compare_lite_link_dest(
+ 
+         /* if size and mtime are the same, we assume the file contents are same */
+         if ((src_size == dst_size) &&
+-            (src_mtime == dst_mtime) && (src_mtime_nsec == dst_mtime_nsec))
++            (src_mtime == dst_mtime) && (comp_mtime_nsec ? (src_mtime_nsec == dst_mtime_nsec):true))
+         {
+             mfu_flist_file_copy(link_compare_list, idx, link_same_list);
+         }
+@@ -1200,12 +1203,12 @@ static int dsync_strmap_compare_lite(
+ 
+         /* if size or mtime is different, we assume the file contents are different */
+         if ((src_size != dst_size) ||
+-            (src_mtime != dst_mtime) || (src_mtime_nsec != dst_mtime_nsec))
++            (src_mtime != dst_mtime) || (comp_mtime_nsec ? (src_mtime_nsec != dst_mtime_nsec):false))
+         {
+             /* update to say contents of the files were found to be different */
+             dsync_strmap_item_update(src_map, name, DCMPF_CONTENT, DCMPS_DIFFER);
+             dsync_strmap_item_update(dst_map, name, DCMPF_CONTENT, DCMPS_DIFFER);
+-
++            
+             /* mark file to be deleted from destination, copied from source */
+             if (!options.dry_run || use_hardlinks) {
+                 mfu_flist_file_copy(dst_compare_list, idx, dst_remove_list);
+@@ -1746,13 +1749,46 @@ static int dsync_strmap_compare(
+             continue;
+         }
+ 
+-        if (! S_ISREG(dst_mode)) {
+-            /* not regular file, take them as common content */
++        /* for now, we can only compare content of regular files and symlinks */
++        if (! S_ISREG(dst_mode) && ! S_ISLNK(dst_mode)) {
++            /* not regular file or symlink, take them as common content */
+             dsync_strmap_item_update(src_map, key, DCMPF_CONTENT, DCMPS_COMMON);
+             dsync_strmap_item_update(dst_map, key, DCMPF_CONTENT, DCMPS_COMMON);
+             continue;
+         }
+ 
++        /* if symlink, check if targets of source and destination files match. If not,
++         * mark the files as being different. */
++        if (S_ISLNK(dst_mode)) {
++            const char* src_name = mfu_flist_file_get_name(src_list, src_index);
++            const char* dst_name = mfu_flist_file_get_name(dst_list, dst_index);
++            int compare_rc = mfu_compare_symlinks(src_name, dst_name, mfu_src_file, mfu_dst_file);
++            if (compare_rc == -1) {
++                /* we hit an error while reading the symlink */
++                rc = -1;
++                MFU_LOG(MFU_LOG_ERR,
++                    "Failed to readlink on %s and/or %s. Assuming contents are different.",
++                    src_name, dst_name);
++            }
++            if (!compare_rc) {
++                /* update to say contents of the files were found to be the same */
++                dsync_strmap_item_update(src_map, key, DCMPF_CONTENT, DCMPS_COMMON);
++                dsync_strmap_item_update(dst_map, key, DCMPF_CONTENT, DCMPS_COMMON);
++            } else {
++                /* update to say contents of the symlinks were found to be different */
++                dsync_strmap_item_update(src_map, key, DCMPF_CONTENT, DCMPS_DIFFER);
++                dsync_strmap_item_update(dst_map, key, DCMPF_CONTENT, DCMPS_DIFFER);
++
++                /* if the destinations are different then we need to remove the file in
++                 * the dst directory, and replace it with the one in the src directory */
++                if (compare_rc > 0 && !options.dry_run) {
++                    mfu_flist_file_copy(src_list, src_index, src_cp_list);
++                    mfu_flist_file_copy(dst_list, dst_index, dst_remove_list);
++                }
++            }
++            continue;
++        }
++
+         /* first check whether file sizes match */
+         dsync_state state;
+         tmp_rc = dsync_strmap_item_state(src_map, key, DCMPF_SIZE, &state);
+@@ -2961,9 +2997,24 @@ dsync_daos_out:
+ }
+ #endif
+ 
++static bool is_mtime_nsec_used(char *srcpath, char *dstpath)
++{
++    struct stat srcpath_stat, dstpath_stat;
++    if (stat(srcpath, &srcpath_stat) == 0 && stat(dstpath, &dstpath_stat) == 0) {
++        if (srcpath_stat.st_mtim.tv_nsec == 0 || dstpath_stat.st_mtim.tv_nsec == 0) {
++           return false; 
++        } else {
++            return true;
++        }
++    } else {
++        return true;
++    }
++}
++
+ int main(int argc, char **argv)
+ {
+     int rc = 0;
++    int walk_rc = 0;
+ 
+     /* initialize MPI and mfu libraries */
+     MPI_Init(&argc, &argv);
+@@ -3115,6 +3166,7 @@ int main(int argc, char **argv)
+             copy_opts->dereference = 1;
+             walk_opts->dereference = 1;
+             copy_opts->no_dereference = 0;
++            break;
+         case 'P':
+             /* turn on no_dereference.
+              * turn off dereference */
+@@ -3246,9 +3298,14 @@ int main(int argc, char **argv)
+     mfu_param_path* srcpath  = &paths[0];
+     mfu_param_path* destpath = &paths[1];
+ 
++    
+     /* process each path */
+     mfu_param_path_set((const char*)argpaths[0], srcpath,  mfu_src_file, true);
+     mfu_param_path_set((const char*)argpaths[1], destpath, mfu_dst_file, false);
++    /* some filesystem don't support 
++     * nanosecond in mtime time stamp aavoid the comp if 
++     * it is the case */
++    comp_mtime_nsec = is_mtime_nsec_used(srcpath->path, destpath->path);
+ 
+     /* advance to next set of options */
+     optind += numargs;
+@@ -3307,7 +3364,21 @@ int main(int argc, char **argv)
+     if (rank == 0) {
+         MFU_LOG(MFU_LOG_INFO, "Walking source path");
+     }
+-    mfu_flist_walk_param_paths(1, srcpath, walk_opts, flist_tmp_src, mfu_src_file);
++    walk_rc = mfu_flist_walk_param_paths(1, srcpath, walk_opts, flist_tmp_src, mfu_src_file);
++
++    /* If we encountered an error during the srcpath walk, the src flist is likely incomplete,
++     * and a delete might delete files already on the destination.  Disable the delete and
++     * notify the user. rsync takes the same approach. */
++    int all_rc;
++    MPI_Allreduce(&walk_rc, &all_rc, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
++    if (all_rc != 0) {
++        if (options.delete == 1) {
++            if (rank == 0) {
++                MFU_LOG(MFU_LOG_ERR, "Errors detected walking source path, delete option disabled");
++            }
++            options.delete = 0;
++	}
++    }
+ 
+     /* check that we actually got something so that we don't delete
+      * an entire target directory because of a typo on the source dir */
+@@ -3333,14 +3404,14 @@ int main(int argc, char **argv)
+     if (rank == 0) {
+         MFU_LOG(MFU_LOG_INFO, "Walking destination path");
+     }
+-    mfu_flist_walk_param_paths(1, destpath, walk_opts, flist_tmp_dst, mfu_dst_file);
++    (void) mfu_flist_walk_param_paths(1, destpath, walk_opts, flist_tmp_dst, mfu_dst_file);
+ 
+     /* walk link-dest path if we have one */
+     if (options.link_dest != NULL) {
+         if (rank == 0) {
+             MFU_LOG(MFU_LOG_INFO, "Walking link-dest path");
+         }
+-        mfu_flist_walk_param_paths(1, linkpath, walk_opts, flist_tmp_link, mfu_dst_file);
++        (void) mfu_flist_walk_param_paths(1, linkpath, walk_opts, flist_tmp_link, mfu_dst_file);
+     }
+ 
+     /* reset the dereference flag */
