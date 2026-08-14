@@ -8,7 +8,11 @@ incomplete Lustre source walk followed by `dsync --delete` removing valid
 destination data. Other reports from the same release window showed that
 repeated synchronizations could miss symbolic-link changes, ignore an explicit
 dereference request, or recopy unchanged files when the two filesystems expose
-different timestamp precision.
+different timestamp precision. Additional public reports showed successful
+status for an unusable destination parent, copy and metadata work continuing
+after a destination-path failure, a single-file sync replacing a destination
+directory symlink, and sparse files expanding when FIEMAP is unavailable even
+though the filesystem exposes sparse seek semantics.
 
 The container contains a fixed public upstream snapshot and all build
 dependencies. It has no external service and the repair must not depend on
@@ -24,7 +28,14 @@ The project is at `/workspace/mpifileutils`. It builds successfully, but:
   `dsync` leaves the stale destination link unchanged;
 - `dsync --dereference` can still copy a source link as a link;
 - a lite comparison can recopy equal files solely because their nanosecond
-  timestamp fields differ on a whole-second-precision filesystem.
+  timestamp fields differ on a whole-second-precision filesystem;
+- a missing destination parent can emit an error but return success, while a
+  parent component that is a regular file can still lead into walk, copy, and
+  metadata phases;
+- synchronizing one file into a destination that is a symbolic link to a
+  directory can replace the link itself instead of creating a child file;
+- `--sparse` can materially allocate source holes on tmpfs, where sparse seek
+  operations work but FIEMAP does not.
 
 Run the supplied reproducer:
 
@@ -37,9 +48,9 @@ cd /workspace/mpifileutils
 A captured Starter run is available at
 `/workspace/mpifileutils/logs/starter-reproduction.log`.
 
-In the Starter, the four summaries include a missing destination checkpoint,
-`dcmp classification: common`, a stale `generation-A` link, a symbolic-link
-result for `--dereference`, and a rewritten destination timestamp.
+The supplied reproducer prints representative summaries for all seven defect
+classes. The hidden verification varies ranks, path shapes, link targets,
+timestamps, and sparse extent positions.
 
 ## Required final behavior
 
@@ -107,6 +118,57 @@ The existing `--contents` mode must continue to detect and replace different
 regular-file bytes even when size and mtime are equal. `--dryrun` must remain
 non-mutating.
 
+### 5. Destination-path validation and phase safety
+
+Before walking the source, `dsync` must validate the ancestry needed to create
+the destination:
+
+- if the destination parent does not exist, or an ancestor component that must
+  be a directory is instead a regular file, the command must return nonzero;
+- the invalid path must not be created or replaced, existing parent bytes and
+  type must remain unchanged, and source walk, copy, and metadata-update phases
+  must not start;
+- the diagnostic must identify the invalid or inaccessible destination parent.
+
+If a destination that existed during argument processing later fails its walk,
+the command must return nonzero after the walk diagnostic and must not continue
+into deletion, copy, ownership, permission, timestamp, or final metadata work.
+A destination that does not yet exist is not a walk failure when its valid,
+writable parent allows it to be created. Existing single-file replacement and
+directory creation behavior must remain available.
+
+### 6. Existing destination-directory topology
+
+When a single non-directory source is synchronized to an existing directory,
+the source basename must be retained:
+
+- a regular destination directory must remain a directory and receive
+  `DESTINATION/BASENAME`;
+- a destination symbolic link whose referent is a directory must remain the
+  same symbolic link with the same stored target text, while the referent
+  receives `BASENAME`;
+- with `--no-dereference`, a single source symbolic link copied through either
+  directory form must become a child symbolic link with identical target text.
+
+This must not add an extra source-directory level to ordinary directory syncs,
+and synchronizing one regular file directly onto another regular file must
+still replace the destination bytes rather than create a child path.
+
+### 7. Sparse-file layout
+
+With `--sparse`, copying a regular file must preserve its logical size and all
+bytes while avoiding material allocation for holes. This includes files with
+leading, interior, or trailing holes and files containing no data extents.
+On tmpfs, where FIEMAP may be unavailable but sparse seek semantics are
+available, the destination allocation reported by `stat` must remain
+materially sparse and within a small filesystem-granularity tolerance of the
+source allocation.
+
+The extent-aware path must work with MPI chunking and a repeated `--sparse`
+sync must leave bytes, logical size, allocated-block count, mode, and mtime
+unchanged. Ordinary fully allocated files must still copy byte-for-byte, and
+invoking `dsync` without `--sparse` must retain its existing behavior.
+
 ## Build and runtime contract
 
 Use the existing build entry point:
@@ -130,7 +192,8 @@ mpirun --oversubscribe -n 2 build/src/dsync/dsync SOURCE DESTINATION
 ```
 
 Inputs are ordinary local POSIX paths and may contain whitespace. Tests use
-small files and directories; no Lustre mount or Slurm daemon is required.
+small files and directories plus bounded files under the container's existing
+tmpfs; no privileged mount, Lustre mount, or Slurm daemon is required.
 
 ## Modification limits
 

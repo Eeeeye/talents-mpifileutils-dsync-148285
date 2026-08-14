@@ -1,0 +1,402 @@
+diff --git a/src/common/mfu_flist_copy.c b/src/common/mfu_flist_copy.c
+index 0775116..578a504 100644
+--- a/src/common/mfu_flist_copy.c
++++ b/src/common/mfu_flist_copy.c
+@@ -2054,6 +2054,168 @@ fail_normal_copy:
+     return -1;
+ }
+
++/* Copy only data extents reported by SEEK_DATA / SEEK_HOLE.  Some Lustre PFL
++ * layouts and tmpfs support these operations while rejecting FIEMAP.  The
++ * normal_copy_required flag distinguishes an unsupported query (safe to fall
++ * back) from a failure after extent copying has started. */
++static int mfu_copy_file_lseek(
++    const char* src,
++    const char* dest,
++    uint64_t offset,
++    uint64_t length,
++    uint64_t file_size,
++    bool* normal_copy_required,
++    mfu_copy_opts_t* copy_opts,
++    mfu_file_t* mfu_src_file,
++    mfu_file_t* mfu_dst_file)
++{
++    *normal_copy_required = true;
++
++    if (copy_opts->direct) {
++        return -1;
++    }
++
++#ifdef DAOS_SUPPORT
++    if (mfu_src_file->type == DFS) {
++        return -1;
++    }
++#endif
++
++    off_t file_end = (off_t) file_size;
++    off_t chunk_start = (off_t) offset;
++    off_t chunk_end = (off_t) (offset + length);
++    if (chunk_end > file_end) {
++        chunk_end = file_end;
++    }
++
++    /* Empty files and empty chunks need only their logical size finalized. */
++    if (chunk_start >= chunk_end) {
++        *normal_copy_required = false;
++        goto complete;
++    }
++
++    errno = 0;
++    off_t data = mfu_file_lseek(src, mfu_src_file, chunk_start, SEEK_DATA);
++    if (data < 0) {
++        if (errno == ENXIO) {
++            /* SEEK_DATA is supported, but this chunk has no more data. */
++            *normal_copy_required = false;
++            goto complete;
++        }
++        return -1;
++    }
++
++    if (data >= chunk_end) {
++        *normal_copy_required = false;
++        goto complete;
++    }
++
++    errno = 0;
++    off_t hole = mfu_file_lseek(src, mfu_src_file, data, SEEK_HOLE);
++    if (hole < 0) {
++        if (errno == ENXIO) {
++            hole = file_end;
++        } else {
++            return -1;
++        }
++    }
++
++    /* Both extent operations are available, so a later error must not fall
++     * back to a normal copy after partially writing the destination. */
++    *normal_copy_required = false;
++
++    size_t buf_size = copy_opts->buf_size;
++    void* buf = copy_opts->block_buf1;
++
++    while (data < chunk_end) {
++        if (hole > chunk_end) {
++            hole = chunk_end;
++        }
++        if (hole < data) {
++            MFU_LOG(MFU_LOG_ERR,
++                "Invalid sparse extent for `%s': data=%lld hole=%lld",
++                src, (long long) data, (long long) hole);
++            return -1;
++        }
++
++        off_t pos = data;
++        while (pos < hole) {
++            size_t bytes = (size_t) MIN((uint64_t) (hole - pos),
++                                        (uint64_t) buf_size);
++            ssize_t num_read = mfu_file_pread(src, buf, bytes, pos, mfu_src_file);
++            if (num_read <= 0) {
++                MFU_LOG(MFU_LOG_ERR,
++                    "Read error in sparse extent `%s' (errno=%d %s)",
++                    src, errno, strerror(errno));
++                return -1;
++            }
++
++            ssize_t written = 0;
++            while (written < num_read) {
++                ssize_t num_written = mfu_file_pwrite(
++                    dest, ((char*) buf) + written,
++                    (size_t) (num_read - written), pos + written,
++                    mfu_dst_file);
++                if (num_written <= 0) {
++                    MFU_LOG(MFU_LOG_ERR,
++                        "Write error in sparse extent `%s' to `%s' (errno=%d %s)",
++                        src, dest, errno, strerror(errno));
++                    return -1;
++                }
++                written += num_written;
++            }
++
++            pos += num_read;
++            mfu_copy_stats.total_bytes_copied += (int64_t) num_read;
++        }
++
++        if (hole >= chunk_end) {
++            break;
++        }
++
++        errno = 0;
++        data = mfu_file_lseek(src, mfu_src_file, hole, SEEK_DATA);
++        if (data < 0) {
++            if (errno == ENXIO) {
++                break;
++            }
++            MFU_LOG(MFU_LOG_ERR,
++                "Failed to find next data extent in `%s' (errno=%d %s)",
++                src, errno, strerror(errno));
++            return -1;
++        }
++        if (data >= chunk_end) {
++            break;
++        }
++
++        errno = 0;
++        hole = mfu_file_lseek(src, mfu_src_file, data, SEEK_HOLE);
++        if (hole < 0) {
++            if (errno == ENXIO) {
++                hole = file_end;
++            } else {
++                MFU_LOG(MFU_LOG_ERR,
++                    "Failed to find next hole in `%s' (errno=%d %s)",
++                    src, errno, strerror(errno));
++                return -1;
++            }
++        }
++    }
++
++complete:
++    if (chunk_end >= file_end || file_size == 0) {
++        if (mfu_file_ftruncate(mfu_dst_file, file_end) < 0) {
++            MFU_LOG(MFU_LOG_ERR,
++                "Failed to truncate destination file: %s (errno=%d %s)",
++                dest, errno, strerror(errno));
++            return -1;
++        }
++    }
++
++    mfu_copy_stats.total_size += (int64_t) (chunk_end - chunk_start);
++    return 0;
++}
++
+ static int mfu_copy_file(
+     const char* src,
+     const char* dest,
+@@ -2086,9 +2248,16 @@ static int mfu_copy_file(
+
+     if (copy_opts->sparse) {
+         bool normal_copy_required;
++        ret = mfu_copy_file_lseek(src, dest, offset, length, file_size,
++                                  &normal_copy_required, copy_opts,
++                                  mfu_src_file, mfu_dst_file);
++        if (!ret || !normal_copy_required) {
++            return ret;
++        }
++
+         ret = mfu_copy_file_fiemap(src, dest, offset, length, file_size,
+-                               &normal_copy_required, copy_opts,
+-                               mfu_src_file, mfu_dst_file);
++                                   &normal_copy_required, copy_opts,
++                                   mfu_src_file, mfu_dst_file);
+         if (!ret || !normal_copy_required) {
+             return ret;
+         }
+diff --git a/src/common/mfu_flist_walk.c b/src/common/mfu_flist_walk.c
+index 85190bc..8ebb780 100644
+--- a/src/common/mfu_flist_walk.c
++++ b/src/common/mfu_flist_walk.c
+@@ -593,6 +593,11 @@ int mfu_flist_walk_paths(uint64_t num_paths, const char** paths,
+                           mfu_walk_opts_t* walk_opts, mfu_flist bflist,
+                           mfu_file_t* mfu_file)
+ {
++    /* Each invocation reports only its own errors.  Without resetting this
++     * process-local flag, an expected partial source-walk error contaminates
++     * the later destination walk and makes it look as though both failed. */
++    WALK_RESULT = 0;
++
+     /* report walk count, time, and rate */
+     double start_walk = MPI_Wtime();
+
+diff --git a/src/common/mfu_param_path.c b/src/common/mfu_param_path.c
+index 44da9e6..31d5f8d 100644
+--- a/src/common/mfu_param_path.c
++++ b/src/common/mfu_param_path.c
+@@ -405,7 +405,9 @@ char* mfu_param_path_copy_dest(const char* name, int numpaths,
+         cut--;
+     }
+     else if ((cut > 0) && mfu_copy_opts->copy_into_dir &&
+-            (mfu_copy_opts->do_sync != 1) && (paths[i].orig[strlen(paths[i].orig) - 1] != '/')) {
++            (!mfu_copy_opts->do_sync ||
++             (paths[i].path_stat_valid && !S_ISDIR(paths[i].path_stat.st_mode))) &&
++            (paths[i].orig[strlen(paths[i].orig) - 1] != '/')) {
+         cut--;
+     }
+
+diff --git a/src/dsync/dsync.c b/src/dsync/dsync.c
+index 8dc42df..4590aa8 100644
+--- a/src/dsync/dsync.c
++++ b/src/dsync/dsync.c
+@@ -3307,6 +3307,81 @@ int main(int argc, char **argv)
+      * it is the case */
+     comp_mtime_nsec = is_mtime_nsec_used(srcpath->path, destpath->path);
+
++    /* Validate the destination ancestry before walking the source.  access(2)
++     * alone is not sufficient because a writable regular file is not a valid
++     * parent directory.  Have rank 0 perform the metadata operations and
++     * broadcast the result so every rank takes the same cleanup path. */
++    mfu_path* dest_parent = mfu_path_from_str(destpath->path);
++    mfu_path_dirname(dest_parent);
++    char* dest_parent_str = mfu_path_strdup(dest_parent);
++    mfu_path_delete(&dest_parent);
++
++    int dest_parent_valid = 1;
++    if (rank == 0) {
++        struct stat dest_parent_stat;
++        if (mfu_file_stat(dest_parent_str, &dest_parent_stat, mfu_dst_file) < 0) {
++            MFU_LOG(MFU_LOG_ERR,
++                "Destination parent directory is not accessible `%s' (errno=%d %s)",
++                dest_parent_str, errno, strerror(errno));
++            dest_parent_valid = 0;
++        } else if (!S_ISDIR(dest_parent_stat.st_mode)) {
++            MFU_LOG(MFU_LOG_ERR,
++                "Destination parent path is not a directory `%s'",
++                dest_parent_str);
++            dest_parent_valid = 0;
++        } else if (mfu_file_access(dest_parent_str, W_OK, mfu_dst_file) < 0) {
++            MFU_LOG(MFU_LOG_ERR,
++                "Destination parent directory is not writable `%s' (errno=%d %s)",
++                dest_parent_str, errno, strerror(errno));
++            dest_parent_valid = 0;
++        }
++    }
++    MPI_Bcast(&dest_parent_valid, 1, MPI_INT, 0, MPI_COMM_WORLD);
++    mfu_free(&dest_parent_str);
++
++    if (!dest_parent_valid) {
++        mfu_param_path_free_all(numargs, paths);
++        mfu_free(&paths);
++        rc = 1;
++        goto dsync_common_cleanup;
++    }
++
++    /* Determine copy topology before building comparison lists.  When a
++     * non-directory source is synchronized into an existing directory, the
++     * object to compare is DEST/basename rather than DEST itself. */
++    int copy_into_dir = 0;
++    if (destpath->path_stat_valid) {
++        if (S_ISDIR(destpath->path_stat.st_mode)) {
++            copy_into_dir = 1;
++        } else if (S_ISLNK(destpath->path_stat.st_mode) &&
++                   destpath->target_stat_valid &&
++                   S_ISDIR(destpath->target_stat.st_mode)) {
++            copy_into_dir = 1;
++        }
++    }
++    copy_opts->copy_into_dir = copy_into_dir;
++
++    mfu_param_path dest_compare_storage;
++    mfu_param_path* dest_compare_path = destpath;
++    int dest_compare_allocated = 0;
++    if (copy_into_dir && srcpath->path_stat_valid &&
++        !S_ISDIR(srcpath->path_stat.st_mode))
++    {
++        mfu_path* dest_item = mfu_path_from_str(destpath->path);
++        mfu_path* src_base = mfu_path_from_str(srcpath->path);
++        mfu_path_basename(src_base);
++        mfu_path_append(dest_item, src_base);
++        char* dest_item_str = mfu_path_strdup(dest_item);
++        mfu_path_delete(&src_base);
++        mfu_path_delete(&dest_item);
++
++        mfu_param_path_set(dest_item_str, &dest_compare_storage,
++                           mfu_dst_file, false);
++        mfu_free(&dest_item_str);
++        dest_compare_path = &dest_compare_storage;
++        dest_compare_allocated = 1;
++    }
++
+     /* advance to next set of options */
+     optind += numargs;
+
+@@ -3340,26 +3415,6 @@ int main(int argc, char **argv)
+             flist_tmp_link = mfu_flist_new();
+         }
+     }
+-    /* Avoid walking source if dest doesn't exist or not writable */
+-    /* compute destination parent path */
+-    mfu_path* dest_parent = mfu_path_from_str(destpath->path);
+-    mfu_path_dirname(dest_parent);
+-    char* dest_parent_str = mfu_path_strdup(dest_parent);
+-    mfu_path_delete(&dest_parent);
+-
+-    /* check that destination parent is writable */
+-    if(mfu_file_access(dest_parent_str, W_OK, mfu_dst_file) < 0) {
+-        mfu_loglevel log_level = MFU_LOG_ERR;
+-        if (options.dry_run)
+-            log_level = MFU_LOG_WARN;
+-        MFU_LOG(log_level, "Destination parent directory is not writable `%s' (errno=%d %s)",
+-                dest_parent_str, errno, strerror(errno));
+-        if (!options.dry_run) {
+-            mfu_free(&dest_parent_str);
+-            goto ERROR;
+-        }
+-    }
+-
+     /* walk source path */
+     if (rank == 0) {
+         MFU_LOG(MFU_LOG_INFO, "Walking source path");
+@@ -3393,6 +3448,11 @@ int main(int argc, char **argv)
+             mfu_param_path_free(linkpath);
+             mfu_free(&linkpath);
+         }
++        if (dest_compare_allocated) {
++            mfu_param_path_free(&dest_compare_storage);
++        }
++        mfu_param_path_free_all(numargs, paths);
++        mfu_free(&paths);
+         rc = 1;
+         goto dsync_common_cleanup;
+     }
+@@ -3404,7 +3464,33 @@ int main(int argc, char **argv)
+     if (rank == 0) {
+         MFU_LOG(MFU_LOG_INFO, "Walking destination path");
+     }
+-    (void) mfu_flist_walk_param_paths(1, destpath, walk_opts, flist_tmp_dst, mfu_dst_file);
++    int dest_walk_rc = mfu_flist_walk_param_paths(1, dest_compare_path, walk_opts,
++                                                  flist_tmp_dst, mfu_dst_file);
++
++    /* A missing destination is expected and will be created later.  If the
++     * destination existed at argument-processing time, however, a failed walk
++     * means comparison is incomplete and copy/metadata phases must not run. */
++    if (dest_compare_path->path_stat_valid && dest_walk_rc != 0) {
++        walk_opts->dereference = tmp_dereference;
++        if (rank == 0) {
++            MFU_LOG(MFU_LOG_ERR,
++                "Errors detected walking destination path, sync aborted");
++        }
++        mfu_flist_free(&flist_tmp_src);
++        mfu_flist_free(&flist_tmp_dst);
++        if (options.link_dest != NULL) {
++            mfu_flist_free(&flist_tmp_link);
++            mfu_param_path_free(linkpath);
++            mfu_free(&linkpath);
++        }
++        if (dest_compare_allocated) {
++            mfu_param_path_free(&dest_compare_storage);
++        }
++        mfu_param_path_free_all(numargs, paths);
++        mfu_free(&paths);
++        rc = 1;
++        goto dsync_common_cleanup;
++    }
+
+     /* walk link-dest path if we have one */
+     if (options.link_dest != NULL) {
+@@ -3419,7 +3505,7 @@ int main(int argc, char **argv)
+
+     /* store src and dest path strings */
+     const char* path_src = srcpath->path;
+-    const char* path_dst = destpath->path;
++    const char* path_dst = dest_compare_path->path;
+
+     char* path_link = NULL;
+     if (options.link_dest != NULL) {
+@@ -3477,6 +3563,10 @@ int main(int argc, char **argv)
+         mfu_free(&linkpath);
+     }
+
++    if (dest_compare_allocated) {
++        mfu_param_path_free(&dest_compare_storage);
++    }
++
+     /* free all param paths */
+     mfu_param_path_free_all(numargs, paths);

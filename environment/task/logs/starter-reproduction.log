@@ -1,6 +1,6 @@
 case 1: incomplete source walk with --delete
 destination checkpoint: missing
-[2026-08-14T06:03:33] [1] [/workspace/mpifileutils/src/common/mfu_flist_walk.c:476] ERROR: Failed to open directory with opendir: '/tmp/dsync-reproduction.FFVQmX/walk/src/restricted' (errno=2 No such file or directory)
+[2026-08-14T18:08:21] [0] [/workspace/mpifileutils/src/common/mfu_flist_walk.c:476] ERROR: Failed to open directory with opendir: '/tmp/dsync-reproduction.0v0Unm/walk/src/restricted' (errno=2 No such file or directory)
 
 case 2: changed symbolic-link target
 dcmp classification: common
@@ -12,3 +12,17 @@ destination type: symbolic link
 case 4: whole-second timestamp precision
 destination mtime before: 2025-01-02 03:04:05.999999999 +0000
 destination mtime after:  2025-01-02 03:04:05.111111111 +0000
+
+case 5: unusable destination parent exit status
+missing-parent status: 0
+[2026-08-14T18:08:28] [0] [/workspace/mpifileutils/src/dsync/dsync.c:3298] ERROR: Destination parent directory is not writable `/tmp/dsync-reproduction.0v0Unm/parent/missing' (errno=2 No such file or directory)
+[2026-08-14T18:08:28] [1] [/workspace/mpifileutils/src/dsync/dsync.c:3298] ERROR: Destination parent directory is not writable `/tmp/dsync-reproduction.0v0Unm/parent/missing' (errno=2 No such file or directory)
+
+case 6: single file to directory symlink
+directory-link status: 0
+destination topology: symlink was replaced
+
+case 7: sparse tmpfs allocation
+source blocks: 8192
+destination blocks: 16384
+logical blocks: 32768

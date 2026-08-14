@@ -5,10 +5,11 @@ project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 dsync_bin="${project_root}/build/src/dsync/dsync"
 dcmp_bin="${project_root}/build/src/dcmp/dcmp"
 case_root="$(mktemp -d /tmp/dsync-reproduction.XXXXXX)"
+shm_root="/dev/shm/dsync-reproduction-$$"
 
 cleanup() {
-    chmod -R u+rwx "${case_root}" 2>/dev/null || true
-    rm -rf "${case_root}"
+    chmod -R u+rwx "${case_root}" "${shm_root}" 2>/dev/null || true
+    rm -rf "${case_root}" "${shm_root}"
 }
 trap cleanup EXIT
 
@@ -79,3 +80,45 @@ run_dsync "${case_root}/mtime/src" "${case_root}/mtime/dst" >/dev/null
 after_mtime="$(stat -c '%y' "${case_root}/mtime/dst/sample.dat")"
 printf 'destination mtime before: %s\n' "${before_mtime}"
 printf 'destination mtime after:  %s\n' "${after_mtime}"
+
+printf '\ncase 5: unusable destination parent exit status\n'
+mkdir -p "${case_root}/parent/source"
+printf 'parent payload\n' > "${case_root}/parent/source/item.dat"
+set +e
+run_dsync "${case_root}/parent/source/item.dat" \
+    "${case_root}/parent/missing/output.dat" \
+    > "${case_root}/parent/output.log" 2>&1
+parent_rc=$?
+set -e
+printf 'missing-parent status: %s\n' "${parent_rc}"
+grep -E 'Destination parent|Walking source|Copying items|Setting ownership' \
+    "${case_root}/parent/output.log" || true
+
+printf '\ncase 6: single file to directory symlink\n'
+mkdir -p "${case_root}/topology/source" "${case_root}/topology/referent"
+printf 'topology payload\n' > "${case_root}/topology/source/payload.dat"
+ln -s referent "${case_root}/topology/destination-link"
+set +e
+run_dsync "${case_root}/topology/source/payload.dat" \
+    "${case_root}/topology/destination-link" >/dev/null 2>&1
+topology_rc=$?
+set -e
+printf 'directory-link status: %s\n' "${topology_rc}"
+if [[ -L "${case_root}/topology/destination-link" ]]; then
+    printf 'destination topology: symlink to %s\n' \
+        "$(readlink "${case_root}/topology/destination-link")"
+else
+    printf 'destination topology: symlink was replaced\n'
+fi
+
+printf '\ncase 7: sparse tmpfs allocation\n'
+mkdir -p "${shm_root}/source" "${shm_root}/destination"
+sparse_src="${shm_root}/source/sparse.bin"
+sparse_dst="${shm_root}/destination/sparse.bin"
+truncate -s 16777216 "${sparse_src}"
+printf 'HEAD' | dd of="${sparse_src}" bs=1 seek=0 conv=notrunc status=none
+printf 'MIDDLE' | dd of="${sparse_src}" bs=1 seek=5243003 conv=notrunc status=none
+run_dsync --sparse "${shm_root}/source" "${shm_root}/destination" >/dev/null
+printf 'source blocks: %s\n' "$(stat -c '%b' "${sparse_src}")"
+printf 'destination blocks: %s\n' "$(stat -c '%b' "${sparse_dst}")"
+printf 'logical blocks: %s\n' "$(( ($(stat -c '%s' "${sparse_dst}") + 511) / 512 ))"

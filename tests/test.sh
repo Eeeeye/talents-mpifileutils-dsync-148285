@@ -20,12 +20,17 @@ exec > >(tee "${log_dir}/dsync-verifier.log") 2>&1
 
 reward=0
 case_root=""
+shm_root=""
 
 finish() {
     status=$?
     if [[ -n "${case_root}" && -d "${case_root}" ]]; then
         chmod -R u+rwx "${case_root}" 2>/dev/null || true
         rm -rf "${case_root}"
+    fi
+    if [[ -n "${shm_root}" && -d "${shm_root}" ]]; then
+        chmod -R u+rwx "${shm_root}" 2>/dev/null || true
+        rm -rf "${shm_root}"
     fi
     if [[ "${status}" -ne 0 ]]; then
         reward=0
@@ -57,6 +62,15 @@ assert_absent() {
 
 assert_equal() {
     [[ "$1" == "$2" ]] || fail "$3 (expected '$1', observed '$2')"
+}
+
+assert_no_phase() {
+    log_file=$1
+    phase_pattern=$2
+    description=$3
+    if grep -Eq "${phase_pattern}" "${log_file}"; then
+        fail "${description}"
+    fi
 }
 
 project_root=/workspace/mpifileutils
@@ -296,6 +310,181 @@ run_dsync 2 -X all "${basic}/source" "${basic}/destination" >/dev/null
 idem_after="$(sha256sum "${idem_file}")|$(stat -c '%a|%y' "${idem_file}")|$("${xattr_helper}" get "${idem_file}" user.dataset)|$(readlink "${basic}/destination/current link")|$(stat -c '%a' "${basic}/destination/nested data")"
 assert_equal "${idem_before}" "${idem_after}" "repeat synchronization changed preserved state"
 pass "content mode, dry-run, missing destination, and idempotence"
+
+printf '\n[8] invalid destination ancestry and failed walks abort later phases\n'
+dest_guard="${case_root}/destination-guard-${nonce}"
+mkdir -p "${dest_guard}/source"
+printf 'guard-source-%s\n' "${nonce}" > "${dest_guard}/source/item.dat"
+
+set +e
+run_dsync 2 "${dest_guard}/source/item.dat" \
+    "${dest_guard}/missing-parent/output.dat" \
+    > "${dest_guard}/missing-parent.log" 2>&1
+missing_parent_rc=$?
+set -e
+[[ "${missing_parent_rc}" -ne 0 ]] \
+    || fail "missing destination parent returned success"
+assert_absent "${dest_guard}/missing-parent"
+grep -Eiq 'destination.*parent|parent.*destination' \
+    "${dest_guard}/missing-parent.log" \
+    || fail "missing-parent diagnostic is absent"
+assert_no_phase "${dest_guard}/missing-parent.log" \
+    'Walking source path|Copying items to destination|Setting ownership, permissions, and timestamps|Updating timestamps on newly copied files' \
+    "missing parent reached source, copy, or metadata work"
+
+printf 'parent-sentinel-%s\n' "${nonce}" > "${dest_guard}/not-a-directory"
+parent_before="$(sha256sum "${dest_guard}/not-a-directory")|$(stat -c '%F|%a' "${dest_guard}/not-a-directory")"
+set +e
+run_dsync 3 "${dest_guard}/source/item.dat" \
+    "${dest_guard}/not-a-directory/output.dat" \
+    > "${dest_guard}/parent-file.log" 2>&1
+parent_file_rc=$?
+set -e
+[[ "${parent_file_rc}" -ne 0 ]] \
+    || fail "non-directory destination parent returned success"
+parent_after="$(sha256sum "${dest_guard}/not-a-directory")|$(stat -c '%F|%a' "${dest_guard}/not-a-directory")"
+assert_equal "${parent_before}" "${parent_after}" \
+    "non-directory parent state changed"
+grep -Eiq 'not a directory|destination.*parent|parent.*destination' \
+    "${dest_guard}/parent-file.log" \
+    || fail "non-directory-parent diagnostic is absent"
+assert_no_phase "${dest_guard}/parent-file.log" \
+    'Walking source path|Copying items to destination|Setting ownership, permissions, and timestamps|Updating timestamps on newly copied files' \
+    "non-directory parent reached source, copy, or metadata work"
+
+mkdir -p "${dest_guard}/walk-source" "${dest_guard}/walk-destination"
+printf 'walk-source-%s\n' "${nonce}" > "${dest_guard}/walk-source/item.dat"
+printf 'walk-destination-%s\n' "${nonce}" > "${dest_guard}/walk-destination/state.dat"
+walk_dest_before="$(sha256sum "${dest_guard}/walk-destination/state.dat")"
+chmod 000 "${dest_guard}/walk-destination"
+set +e
+run_dsync 2 "${dest_guard}/walk-source" "${dest_guard}/walk-destination" \
+    > "${dest_guard}/destination-walk.log" 2>&1
+destination_walk_rc=$?
+set -e
+chmod 0700 "${dest_guard}/walk-destination"
+[[ "${destination_walk_rc}" -ne 0 ]] \
+    || fail "failed destination walk returned success"
+assert_equal "${walk_dest_before}" \
+    "$(sha256sum "${dest_guard}/walk-destination/state.dat")" \
+    "failed destination walk changed destination bytes"
+grep -Eiq 'destination.*walk|walk.*destination' \
+    "${dest_guard}/destination-walk.log" \
+    || fail "destination-walk diagnostic is absent"
+assert_no_phase "${dest_guard}/destination-walk.log" \
+    'Deleting items from destination|Copying items to destination|Setting ownership, permissions, and timestamps|Updating timestamps on newly copied files' \
+    "failed destination walk continued into destructive or metadata work"
+pass "destination ancestry and failed-walk phase safety"
+
+printf '\n[9] single-file topology for real and symlinked directories\n'
+topology="${case_root}/topology-${nonce}"
+mkdir -p "${topology}/source" "${topology}/real-destination" \
+    "${topology}/link-referent"
+printf 'topology-payload-%s\n' "${nonce}" > "${topology}/source/payload.dat"
+run_dsync 1 "${topology}/source/payload.dat" \
+    "${topology}/real-destination" >/dev/null
+[[ -d "${topology}/real-destination" && ! -L "${topology}/real-destination" ]] \
+    || fail "real destination directory was replaced"
+cmp "${topology}/source/payload.dat" \
+    "${topology}/real-destination/payload.dat" \
+    || fail "single-file basename was not retained in a real directory"
+
+ln -s link-referent "${topology}/destination-link"
+destination_link_before="$(readlink "${topology}/destination-link")"
+run_dsync 2 "${topology}/source/payload.dat" \
+    "${topology}/destination-link" >/dev/null
+assert_link "${topology}/destination-link"
+assert_equal "${destination_link_before}" \
+    "$(readlink "${topology}/destination-link")" \
+    "destination directory-link target changed"
+cmp "${topology}/source/payload.dat" \
+    "${topology}/link-referent/payload.dat" \
+    || fail "single file was not copied through a destination directory link"
+
+ln -s payload.dat "${topology}/source/current"
+run_dsync 3 --no-dereference "${topology}/source/current" \
+    "${topology}/destination-link" >/dev/null
+assert_link "${topology}/destination-link"
+assert_link "${topology}/link-referent/current"
+assert_equal 'payload.dat' "$(readlink "${topology}/link-referent/current")" \
+    "single source-link target text was not retained as a child"
+
+printf 'replacement-old-%s\n' "${nonce}" > "${topology}/replacement.dat"
+run_dsync 2 "${topology}/source/payload.dat" \
+    "${topology}/replacement.dat" >/dev/null
+assert_file "${topology}/replacement.dat"
+cmp "${topology}/source/payload.dat" "${topology}/replacement.dat" \
+    || fail "direct file-to-file replacement stopped working"
+pass "single-file basename, directory-link, and file replacement topology"
+
+printf '\n[10] tmpfs sparse extent preservation and repeat stability\n'
+shm_root="/dev/shm/dsync-verifier-${nonce}-$$"
+mkdir -p "${shm_root}/source" "${shm_root}/destination"
+
+sparse_src="${shm_root}/source/sparse.bin"
+leading_src="${shm_root}/source/leading.bin"
+empty_src="${shm_root}/source/empty-extents.bin"
+ordinary_src="${shm_root}/source/ordinary.bin"
+
+truncate -s 16777216 "${sparse_src}"
+printf 'HEAD-%s' "${nonce}" | \
+    dd of="${sparse_src}" bs=1 seek=0 conv=notrunc status=none
+printf 'MIDDLE-%s' "${nonce}" | \
+    dd of="${sparse_src}" bs=1 seek=5243003 conv=notrunc status=none
+
+truncate -s 33554432 "${leading_src}"
+printf 'LEADING-HOLE-%s' "${nonce}" | \
+    dd of="${leading_src}" bs=1 seek=4194427 conv=notrunc status=none
+printf 'END-%s' "${nonce}" | \
+    dd of="${leading_src}" bs=1 seek=33554380 conv=notrunc status=none
+
+truncate -s 8388608 "${empty_src}"
+dd if=/dev/urandom of="${ordinary_src}" bs=131072 count=1 status=none
+chmod 0640 "${sparse_src}" "${leading_src}" "${empty_src}" "${ordinary_src}"
+touch -d '2026-07-08 09:10:11.123456789 UTC' \
+    "${sparse_src}" "${leading_src}" "${empty_src}" "${ordinary_src}"
+
+# Begin with a dense same-size destination to verify that old allocations are
+# discarded before source holes are reconstructed.
+dd if=/dev/zero of="${shm_root}/destination/sparse.bin" \
+    bs=1048576 count=16 status=none
+
+run_dsync 3 --sparse "${shm_root}/source" "${shm_root}/destination" >/dev/null
+
+for sparse_name in sparse.bin leading.bin empty-extents.bin ordinary.bin; do
+    cmp "${shm_root}/source/${sparse_name}" \
+        "${shm_root}/destination/${sparse_name}" \
+        || fail "sparse-mode bytes differ for ${sparse_name}"
+    assert_equal "$(stat -c '%s' "${shm_root}/source/${sparse_name}")" \
+        "$(stat -c '%s' "${shm_root}/destination/${sparse_name}")" \
+        "logical size differs for ${sparse_name}"
+done
+
+for sparse_name in sparse.bin leading.bin empty-extents.bin; do
+    sparse_size="$(stat -c '%s' "${shm_root}/source/${sparse_name}")"
+    source_blocks="$(stat -c '%b' "${shm_root}/source/${sparse_name}")"
+    destination_blocks="$(stat -c '%b' "${shm_root}/destination/${sparse_name}")"
+    logical_blocks=$(( (sparse_size + 511) / 512 ))
+    [[ "${destination_blocks}" -lt $(( logical_blocks / 2 )) ]] \
+        || fail "${sparse_name} is not materially sparse (${destination_blocks}/${logical_blocks})"
+    [[ "${destination_blocks}" -le $(( source_blocks + 2048 )) ]] \
+        || fail "${sparse_name} allocation exceeds source tolerance (${destination_blocks}/${source_blocks})"
+done
+
+sparse_state_before=""
+for sparse_name in sparse.bin leading.bin empty-extents.bin ordinary.bin; do
+    sparse_state_before+="$(sha256sum "${shm_root}/destination/${sparse_name}")|"
+    sparse_state_before+="$(stat -c '%s|%b|%a|%y' "${shm_root}/destination/${sparse_name}")|"
+done
+run_dsync 2 --sparse "${shm_root}/source" "${shm_root}/destination" >/dev/null
+sparse_state_after=""
+for sparse_name in sparse.bin leading.bin empty-extents.bin ordinary.bin; do
+    sparse_state_after+="$(sha256sum "${shm_root}/destination/${sparse_name}")|"
+    sparse_state_after+="$(stat -c '%s|%b|%a|%y' "${shm_root}/destination/${sparse_name}")|"
+done
+assert_equal "${sparse_state_before}" "${sparse_state_after}" \
+    "repeat sparse synchronization changed bytes, allocation, mode, or mtime"
+pass "leading, interior, trailing, and empty sparse extents"
 
 reward=1
 printf '\nALL TESTS PASSED\n'
