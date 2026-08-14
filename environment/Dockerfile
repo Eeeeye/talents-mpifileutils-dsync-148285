@@ -65,3 +65,8 @@ WORKDIR /workspace/mpifileutils
 USER ubuntu
 
 RUN ./scripts/build.sh
+
+# Harbor initializes Oracle and Verifier from the image's default user, which
+# must be root.  The candidate Agent still runs as ubuntu via task.toml so the
+# permission-sensitive source-walk failure remains observable.
+USER root
